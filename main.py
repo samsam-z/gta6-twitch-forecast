@@ -1,14 +1,10 @@
-"""GTA VI launch-day Twitch viewer forecast (program/v1 entry).
+"""GTA VI launch-day Twitch audience forecast.
 
-Model: learn the empirical distribution of hour-h / hour-1 viewer ratios
-from the comparable launches supplied in the case, then apply its quantiles
-in log space to this case's hour-1 print.
-
-Rationale: pinball loss on the log scale is minimised by the true quantiles.
-A large launch decays from its first hour in a broadly similar way across
-titles; the cross-title distribution of those decay ratios is a better
-calibrated forecast than assuming viewers simply persist (the baseline).
-All randomness is absent; output is byte-identical across runs.
+The program learns how each comparable title's hourly audience decays relative
+to its own first hour, then transfers that empirical decay distribution onto
+this case's observed hour-one audience. Quantiles are taken in log space,
+where pinball loss is minimised by the true conditional quantiles. No random
+state is used, so repeated runs emit byte-identical output files.
 """
 import json
 import math
@@ -18,112 +14,122 @@ from pathlib import Path
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-SIGMA = 0.15
+
+# Quantiles scored by the competition, paired with standard-normal seeds.
+QUANTILES = (0.05, 0.25, 0.50, 0.75, 0.95)
+NORMAL_SEEDS = (-1.6448536269514722, -0.6744897501960817, 0.0,
+                0.6744897501960817, 1.6448536269514722)
+
+# Log-scale diffusion used only when a given hour has no comparable decay.
+FALLBACK_SIGMA = 0.15
+
+# Similarity weighting: comparables whose hour-one audience is far from this
+# case lose influence exponentially. Tuned by leave-one-out validation
+# (weighted loss ~0.359 vs ~0.403 with equal weights).
+SIMILARITY_DECAY = 1.0
+
+# Hour-h / hour-1 ratios outside this band are category artefacts, not signal.
+MIN_RATIO = 1e-4
+MAX_RATIO = 1e2
 
 
-def dt(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def parse_time(value):
+    """Parse an ISO-8601 timestamp, tolerating a trailing Z suffix."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def hour_viewers(c, day_start):
-    """Map hour 1..24 (from the comparable's release-day start) to viewers."""
-    start = dt(day_start)
-    hv = {}
-    for x in c["hourly"]:
-        h = int(round((dt(x["from"]) - start).total_seconds() / 3600.0)) + 1
-        if 1 <= h <= 24 and h not in hv and x.get("viewers"):
-            hv[h] = x["viewers"]
-    return hv
+def hourly_audience(comparable, launch_day):
+    """Map hours 1..24 (counted from the launch day) to viewers."""
+    origin = parse_time(launch_day)
+    series = {}
+    for point in comparable["hourly"]:
+        hour = int(round((parse_time(point["from"]) - origin).total_seconds() / 3600)) + 1
+        viewers = point.get("viewers")
+        if 1 <= hour <= 24 and hour not in series and viewers and viewers > 0:
+            series[hour] = viewers
+    return series
 
 
-def baseline(p1, h):
-    return [p1 * math.exp(z * SIGMA * math.sqrt(h - 1)) for z in Z]
+def gaussian_fallback(anchor, hour):
+    """Log-normal quantile fan around the anchor when no decay data exists."""
+    # hour 1 is the known anchor itself, so its fan has zero spread; spread
+    # then widens with the square root of elapsed hours (diffusion prior).
+    spread = FALLBACK_SIGMA * math.sqrt(max(hour - 1, 0))
+    return [anchor * math.exp(seed * spread) for seed in NORMAL_SEEDS]
 
 
-def empirical(train_logs, p1):
-    """Quantiles of a sorted list of log ratios, linearly interpolated."""
-    n = len(train_logs)
-    if n == 0:
-        return None
-    out = []
-    for tau in LEVELS:
-        pos = tau * (n - 1)
-        lo = int(math.floor(pos))
-        hi = min(lo + 1, n - 1)
-        frac = pos - lo
-        lv = train_logs[lo] * (1 - frac) + train_logs[hi] * frac
-        out.append(p1 * math.exp(lv))
-    return out
+def weighted_decay_quantiles(samples, log_anchor, level_anchor):
+    """Weighted empirical quantiles of log-decay samples.
+
+    Each sample is a (log_decay, log_launch_size) pair. A comparable close in
+    launch size to the current case receives exponentially more weight.
+    """
+    scored = [(decay, math.exp(-SIMILARITY_DECAY * abs(size - log_anchor)))
+              for decay, size in samples]
+    scored.sort(key=lambda pair: pair[0])
+    total_mass = sum(weight for _, weight in scored)
+    result = []
+    for tau in QUANTILES:
+        cutoff = tau * total_mass
+        accumulated = 0.0
+        chosen = scored[-1][0]
+        for decay, weight in scored:
+            accumulated += weight
+            if accumulated >= cutoff:
+                chosen = decay
+                break
+        result.append(level_anchor * math.exp(chosen))
+    return result
 
 
-def forecast_case(case):
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
-    p1 = max(1.0, float(first["viewers"])) if first else 1.0
+def predict(case):
+    """Return the five-quantile forecast for every requested hour."""
+    first_known = next((row for row in case["known"] if row["hour"] == 1), None)
+    level_one = max(1.0, float(first_known["viewers"])) if first_known else 1.0
+    log_one = math.log(level_one)
 
-    # Collect per-hour log ratios from every comparable launch, together
-    # with each launch's own hour-1 print. A launch closer in size to this
-    # case decays more like it, so it gets more weight (validated by
-    # leave-one-out: weighted loss 0.359 vs equal-weight 0.403).
-    by_hour = {h: [] for h in range(2, 25)}  # (log_ratio, log_p1_of_that_launch)
-    log_p1 = math.log(p1)
-    for c in case.get("comparables") or []:
-        hv = hour_viewers(c, c["day_start"])
-        base = hv.get(1)
-        if not base or base <= 0:
+    decay_by_hour = {}
+    for comparable in case.get("comparables") or []:
+        series = hourly_audience(comparable, comparable["day_start"])
+        opening = series.get(1)
+        if not opening or opening <= 0:
             continue
-        log_base = math.log(float(base))
-        for h in range(2, 25):
-            v = hv.get(h)
-            if v and v > 0:
-                ratio = v / base
-                # Guard against pathological spikes from tiny categories.
-                if 1e-4 < ratio < 1e2:
-                    by_hour[h].append((math.log(ratio), log_base))
+        log_opening = math.log(float(opening))
+        for hour in range(2, 25):
+            audience = series.get(hour)
+            if not audience or audience <= 0:
+                continue
+            ratio = audience / opening
+            if MIN_RATIO < ratio < MAX_RATIO:
+                decay_by_hour.setdefault(hour, []).append(
+                    (math.log(ratio), log_opening))
 
-    hours = []
+    forecast = []
     for row in case["forecast"]:
-        h = row["hour"]
-        samples = by_hour.get(h, [])
+        hour = row["hour"]
+        samples = decay_by_hour.get(hour)
         if samples:
-            # Exponentially down-weight comparables far from this case's size.
-            weighted = []
-            for log_r, log_b in samples:
-                w = math.exp(-1.0 * abs(log_b - log_p1))
-                weighted.append((log_r, w))
-            weighted.sort()
-            total = sum(w for _, w in weighted)
-            q = []
-            for tau in LEVELS:
-                target = tau * total
-                acc = 0.0
-                val = weighted[-1][0]
-                for lv, w in weighted:
-                    acc += w
-                    if acc >= target:
-                        val = lv
-                        break
-                q.append(p1 * math.exp(val))
+            quantiles = weighted_decay_quantiles(samples, log_one, level_one)
         else:
-            q = baseline(p1, h)
-        # Enforce shape: positive, non-decreasing, finite.
-        q = [min(1e9, max(1e-6, float(x))) for x in q]
-        for i in range(1, 5):
-            if q[i] < q[i - 1]:
-                q[i] = q[i - 1]
-        hours.append({"hour": h, "q": [round(x, 4) for x in q]})
-    return {"hours": hours}
+            quantiles = gaussian_fallback(level_one, hour)
+        # Keep every value finite and positive; a single non-finite number
+        # would invalidate the whole JSON line at scoring time.
+        quantiles = [min(1e9, max(1e-6, float(q))) if math.isfinite(q) else level_one
+                     for q in quantiles]
+        for idx in range(1, len(quantiles)):
+            quantiles[idx] = max(quantiles[idx], quantiles[idx - 1])
+        forecast.append({"hour": hour, "q": [round(q, 4) for q in quantiles]})
+    return {"hours": forecast}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        out = forecast_case(case)
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(
-            json.dumps(out, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+    for source in sorted(INPUT_DIR.glob("*.in")):
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        result = predict(payload)
+        target = OUTPUT_DIR / (source.stem + ".out")
+        target.write_text(json.dumps(result, separators=(",", ":")) + "\n",
+                          encoding="utf-8")
 
 
 if __name__ == "__main__":
